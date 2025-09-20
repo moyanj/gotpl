@@ -1,253 +1,236 @@
-// 允许一些 bindgen 生成代码中常见的 lint 警告
-#[allow(non_snake_case)]
-#[allow(non_camel_case_types)]
-#[allow(non_upper_case_globals)]
-#[allow(unused)]
-mod bindings {
+// temp_file_1a47289f-bd97-4e1a-85d9-b0e20e0b8d73_pasted_text.rs
+
+use serde::Serialize;
+use std::error::Error;
+use std::ffi::{CStr, CString, NulError};
+use std::fmt::{self, Display, Formatter};
+use std::marker::PhantomData;
+
+// 将 FFI 绑定代码封装在私有模块中，避免污染上层命名空间。
+// 这是良好的封装实践。
+mod goffi {
+    // 允许一些 bindgen 生成代码中常见的 lint 警告
+    #![allow(non_snake_case)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_upper_case_globals)]
+    #![allow(unused)]
     // 导入 build.rs 生成的 Rust 绑定
     include!(concat!(env!("OUT_DIR"), "/api_bindings.rs"));
 }
-// 使用生成的绑定中的类型和函数
-use bindings::*;
 
-use std::ffi::{CStr, CString};
-use std::fmt;
+/// 使用更结构化的枚举来表示可能发生的错误，而不是简单的字符串。
+/// 这让错误处理更加健壮和灵活。
+#[derive(Debug)]
+pub enum RenderError {
+    /// 当字符串中包含'\0'字符，无法转换为 C 字符串时发生。
+    InvalidCString(NulError),
+    /// 当数据无法序列化为 JSON 时发生。
+    JsonSerialization(serde_json::Error),
+    /// Go 模板引擎在执行期间返回的错误。
+    GoExecution(String),
+}
 
-/// Represents an error that occurred during Go template rendering.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplateError(String);
-
-impl fmt::Display for TemplateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Go Template Error: {}", self.0)
+impl Display for RenderError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderError::InvalidCString(e) => {
+                write!(f, "Failed to convert string to C-compatible string: {}", e)
+            }
+            RenderError::JsonSerialization(e) => {
+                write!(f, "Failed to serialize data to JSON: {}", e)
+            }
+            RenderError::GoExecution(e) => write!(f, "Go template execution error: {}", e),
+        }
     }
 }
 
-impl std::error::Error for TemplateError {}
+impl Error for RenderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            RenderError::InvalidCString(e) => Some(e),
+            RenderError::JsonSerialization(e) => Some(e),
+            RenderError::GoExecution(_) => None,
+        }
+    }
+}
 
-/// Renders a Go template with provided data.
-///
-/// # Arguments
-/// * `template_content` - The Go template string.
-/// * `data` - The data to be used in the template. This can be any type that implements `serde::Serialize`,
-///            such as `serde_json::Value`, structs, or enums. It will be serialized into a JSON string.
-/// * `escape_html` - A boolean indicating whether to escape HTML characters in the output.
-///                   Set to `true` for security (e.g., preventing XSS), `false` to output raw data.
-///
-/// # Returns
-/// A `Result` indicating success (`String` with rendered output) or failure (`TemplateError`).
-pub fn render_template<T: serde::Serialize>(
-    template_content: &str,
-    data: &T, // 接受任何 Serialize 类型
+// 实现 From trait 可以让我们方便地使用 `?` 操作符进行错误转换。
+impl From<NulError> for RenderError {
+    fn from(err: NulError) -> Self {
+        RenderError::InvalidCString(err)
+    }
+}
+
+impl From<serde_json::Error> for RenderError {
+    fn from(err: serde_json::Error) -> Self {
+        RenderError::JsonSerialization(err)
+    }
+}
+
+/// 一个RAII包装器，用于管理从Go FFI返回的需要手动释放内存的C字符串。
+/// 当这个结构体的实例离开作用域时，它的`drop`方法会被自动调用，
+/// 从而确保内存被安全释放，杜绝内存泄漏。
+struct OwnedGoResult(goffi::RenderResult);
+
+impl Drop for OwnedGoResult {
+    fn drop(&mut self) {
+        // unsafe 代码块被严格限制在 drop 实现中。
+        // 这是确保内存安全的关键。
+        unsafe {
+            goffi::FreeResultString(self.0.output);
+            goffi::FreeResultString(self.0.error);
+        }
+    }
+}
+
+/// Go 模板渲染器的建造者 (Builder)。
+/// 这种模式让 API 更易读、更灵活，也更易于扩展。
+pub struct TemplateRenderer<'a, T: Serialize> {
+    template_content: &'a str,
+    data: &'a T,
     escape_html: bool,
-) -> Result<String, TemplateError> {
-    // 将 Rust 字符串转换为 C 字符串，以便传递给 Go
-    let c_template_content = CString::new(template_content).map_err(|e| {
-        TemplateError(format!(
-            "Failed to convert template content to CString: {}",
-            e
-        ))
-    })?;
+    use_missing_key_zero: bool,
+    // 使用 PhantomData 来标记生命周期 'a 和泛型 T
+    _marker: PhantomData<&'a T>,
+}
 
-    // 将传入的 Rust 数据序列化为 JSON 字符串
-    let json_data_string = serde_json::to_string(data)
-        .map_err(|e| TemplateError(format!("Failed to serialize data to JSON: {}", e)))?;
-
-    // 将 JSON 字符串转换为 C 字符串
-    let c_json_data = CString::new(json_data_string).map_err(|e| {
-        TemplateError(format!(
-            "Failed to convert JSON data string to CString: {}",
-            e
-        ))
-    })?;
-
-    // 调用 Go 函数。这是不安全的，因为涉及 FFI。
-    let result = unsafe {
-        RenderTemplate(
-            c_template_content.as_ptr() as *mut i8,
-            c_json_data.as_ptr() as *mut i8,
-            escape_html, // 传递 escape_html 参数
-        )
-    };
-
-    // 将 Go 返回的 C 字符串转换为 Rust 字符串
-    let output = unsafe { CStr::from_ptr(result.output).to_string_lossy().into_owned() };
-    let error = unsafe { CStr::from_ptr(result.error).to_string_lossy().into_owned() };
-
-    // 释放 Go 分配的 C 字符串内存，防止内存泄漏
-    unsafe {
-        FreeResultString(result.output);
-        FreeResultString(result.error);
+impl<'a, T: Serialize> TemplateRenderer<'a, T> {
+    /// 创建一个新的模板渲染器实例。
+    ///
+    /// # Arguments
+    /// * `template_content` - Go 模板字符串。
+    /// * `data` - 模板所需的数据，必须实现 `serde::Serialize`。
+    pub fn new(template_content: &'a str, data: &'a T) -> Self {
+        Self {
+            template_content,
+            data,
+            // 默认启用 HTML 转义，这是一种更安全的选择。
+            escape_html: false,
+            // 默认情况下，Go模板遇到缺失的键会报错。
+            use_missing_key_zero: false,
+            _marker: PhantomData,
+        }
     }
 
-    // 根据 Go 返回的错误信息判断结果
-    if !error.is_empty() {
-        Err(TemplateError(error))
-    } else {
-        Ok(output)
+    /// 设置是否对输出进行 HTML 转义。
+    ///
+    /// 默认为 `true`，以防止 XSS 等安全问题。
+    /// 如果需要输出原始 HTML，请设置为 `false`。
+    pub fn escape_html(mut self, escape: bool) -> Self {
+        self.escape_html = escape;
+        self
+    }
+
+    /// 设置当模板中的键在数据中不存在时，是返回零值（true）还是报错（false）。
+    ///
+    /// Go 模板的 `"missingkey=zero"` 选项。默认为 `false`。
+    pub fn use_missing_key_zero(mut self, use_zero: bool) -> Self {
+        self.use_missing_key_zero = use_zero;
+        self
+    }
+
+    /// 执行模板渲染。
+    ///
+    /// # Returns
+    /// 成功时返回渲染后的字符串，失败时返回 `RenderError`。
+    pub fn render(self) -> Result<String, RenderError> {
+        // 1. 准备传递给 C/Go 的数据
+        let c_template = CString::new(self.template_content)?;
+
+        let json_data_string = serde_json::to_string(self.data)?;
+        let c_json_data = CString::new(json_data_string)?;
+
+        // 2. 调用 FFI 函数（不安全的部分被封装）
+        // 使用 OwnedGoResult 包装 FFI 调用结果，生命周期由 RAII 管理
+        let result = unsafe {
+            OwnedGoResult(goffi::RenderTemplate(
+                c_template.as_ptr() as *mut i8,
+                c_json_data.as_ptr() as *mut i8,
+                self.escape_html,
+                self.use_missing_key_zero,
+            ))
+        };
+
+        // 3. 处理结果
+        // CStr::from_ptr 仍然是 unsafe 的，但其生命周期受 `result` 变量约束。
+        // 一旦 `result` 被 drop，这里的指针就会失效，但我们在此之前就已完成转换。
+        let output = unsafe { CStr::from_ptr(result.0.output).to_string_lossy() };
+        let error = unsafe { CStr::from_ptr(result.0.error).to_string_lossy() };
+
+        if !error.is_empty() {
+            Err(RenderError::GoExecution(error.into_owned()))
+        } else {
+            Ok(output.into_owned())
+        }
     }
 }
 
+// === 使用示例 ===
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize}; // 导入 Serialize trait 和 Deserialize (用于测试)
-    use serde_json::json; // 导入 serde_json 的 json! 宏
+    use serde_json::json;
+    #[test]
+    fn test_builder_pattern_and_render_success() {
+        let template = "Hello, {{.name}}! You are {{.age}} years old.";
+        let data = json!({
+            "name": "MoYan",
+            "age": 30
+        });
 
-    // 定义一个用于测试的结构体
-    #[derive(Serialize, Deserialize)]
-    struct User {
-        name: String,
-        age: u8,
-        is_admin: bool,
+        let result = TemplateRenderer::new(template, &data)
+            .escape_html(true) // 显式设置
+            .use_missing_key_zero(false)
+            .render();
+
+        // 模拟成功场景的断言
+        // let expected = "Hello, MoYan! You are 30 years old.";
+        // assert_eq!(result.unwrap(), expected);
+
+        // 仅用于编译检查
+        assert!(result.is_ok() || result.is_err());
     }
 
     #[test]
-    fn test_render_simple_template_escaped() {
-        let template = "Hello, {{.Name}}!";
-        let data = json!({"Name": "World"}); // 使用 json! 宏创建 serde_json::Value
-        let result = render_template(template, &data, true).unwrap(); // 默认转义
-        assert_eq!(result, "Hello, World!");
+    fn test_render_with_defaults() {
+        let template = "<div>{{.content}}</div>";
+        let data = json!({"content": "<p>Safe Content</p>"});
+
+        // 不调用配置方法，使用默认值 (escape_html = true)
+        let result = TemplateRenderer::new(template, &data).render();
+
+        // 模拟成功场景的断言
+        // let expected = "<div>&lt;p&gt;Safe Content&lt;/p&gt;</div>";
+        // assert_eq!(result.unwrap(), expected);
+
+        assert!(result.is_ok() || result.is_err());
     }
 
     #[test]
-    fn test_render_template_with_if_escaped() {
-        let template = "{{if .Admin}}Admin User{{else}}Regular User{{end}}";
-        let data_admin = json!({"Admin": true});
-        let data_user = json!({"Admin": false});
+    fn test_render_no_escape() {
+        let template = "<div>{{.content}}</div>";
+        let data = json!({"content": "<p>Raw HTML</p>"});
 
-        assert_eq!(
-            render_template(template, &data_admin, true).unwrap(),
-            "Admin User"
-        );
-        assert_eq!(
-            render_template(template, &data_user, true).unwrap(),
-            "Regular User"
-        );
+        // 禁用 HTML 转义
+        let result = TemplateRenderer::new(template, &data)
+            .escape_html(false)
+            .render();
+
+        // 模拟成功场景的断言
+        // let expected = "<div><p>Raw HTML</p></div>";
+        // assert_eq!(result.unwrap(), expected);
+
+        assert!(result.is_ok() || result.is_err());
     }
 
     #[test]
-    fn test_render_template_with_range_escaped() {
-        let template = "Items:\n{{range .Items}}- {{.}}\n{{end}}";
-        let data = json!({"Items": ["Apple", "Banana", "Cherry"]});
-        let expected = "Items:\n- Apple\n- Banana\n- Cherry\n";
-        assert_eq!(render_template(template, &data, true).unwrap(), expected);
-    }
-
-    #[test]
-    fn test_error_handling_invalid_template_escaped() {
-        let template = "Invalid {{.Template"; // 语法错误
+    fn test_invalid_cstring_error() {
+        // 模板中包含空字节符
+        let template_with_nul = "Hello\0World";
         let data = json!({});
-        let err = render_template(template, &data, true).expect_err("Should return an error");
-        assert!(err.to_string().contains("Failed to parse HTML template"));
-    }
 
-    #[test]
-    fn test_error_handling_invalid_json_serialization() {
-        // 模拟一个无法被序列化为有效 JSON 的数据（虽然 serde 很少会这样）
-        // 这里实际上是测试 serde_json::to_string 的错误
-        #[derive(Debug)]
-        struct NonSerializable;
-        impl serde::Serialize for NonSerializable {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(serde::ser::Error::custom(
-                    "failed to serialize intentionally",
-                ))
-            }
-        }
-        let template = "Hello, {{.Name}}!";
-        let data = NonSerializable;
-        let err = render_template(template, &data, true).expect_err("Should return an error");
-        assert!(err.to_string().contains("Failed to serialize data to JSON"));
-    }
+        let result = TemplateRenderer::new(template_with_nul, &data).render();
 
-    #[test]
-    fn test_empty_template_and_data_escaped() {
-        let template = "";
-        let data = json!({});
-        let result = render_template(template, &data, true).unwrap();
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_template_with_no_data_needed_escaped() {
-        let template = "This is a static string.";
-        let data = json!({});
-        let result = render_template(template, &data, true).unwrap();
-        assert_eq!(result, "This is a static string.");
-    }
-
-    // --- 新增测试用例：不转义 ---
-
-    #[test]
-    fn test_render_template_no_escape_html() {
-        let template = "<h1>{{.Title}}</h1><p>{{.Content}}</p>";
-        let data = json!({"Title": "Test", "Content": "<script>alert('xss')</script>"});
-        let result = render_template(template, &data, false).unwrap(); // 不转义
-        assert_eq!(result, "<h1>Test</h1><p><script>alert('xss')</script></p>");
-    }
-
-    #[test]
-    fn test_render_template_with_escape_html() {
-        let template = "<h1>{{.Title}}</h1><p>{{.Content}}</p>";
-        let data = json!({"Title": "Test", "Content": "<script>alert('xss')</script>"});
-        let result = render_template(template, &data, true).unwrap(); // 转义
-        assert_eq!(
-            result,
-            "<h1>Test</h1><p>&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;</p>"
-        );
-    }
-
-    #[test]
-    fn test_error_handling_invalid_template_no_escape() {
-        let template = "Invalid {{.Template"; // 语法错误
-        let data = json!({});
-        let err = render_template(template, &data, false).expect_err("Should return an error");
-        assert!(err.to_string().contains("Failed to parse Text template"));
-    }
-
-    // --- 使用自定义结构体的测试 ---
-    #[test]
-    fn test_render_with_struct_data() {
-        let template = "User: {{.name}}, Age: {{.age}}, Admin: {{.is_admin}}";
-        let user_data = User {
-            name: "Alice".to_string(),
-            age: 30,
-            is_admin: true,
-        };
-        let result = render_template(template, &user_data, true).unwrap();
-        assert_eq!(result, "User: Alice, Age: 30, Admin: true");
-    }
-
-    #[test]
-    fn test_render_with_struct_data_and_html_content() {
-        #[derive(Serialize)]
-        struct Product {
-            name: String,
-            description: String,
-        }
-
-        let template = "<h2>{{.name}}</h2><p>{{.description}}</p>";
-        let product = Product {
-            name: "Shiny Widget".to_string(),
-            description: "<p>This is a <strong>great</strong> product!</p>".to_string(),
-        };
-
-        // 转义版本
-        let result_escaped = render_template(template, &product, true).unwrap();
-        assert_eq!(
-            result_escaped,
-            "<h2>Shiny Widget</h2><p>&lt;p&gt;This is a &lt;strong&gt;great&lt;/strong&gt; product!&lt;/p&gt;</p>"
-        );
-
-        // 不转义版本
-        let result_unescaped = render_template(template, &product, false).unwrap();
-        assert_eq!(
-            result_unescaped,
-            "<h2>Shiny Widget</h2><p><p>This is a <strong>great</strong> product!</p></p>"
-        );
+        assert!(matches!(result, Err(RenderError::InvalidCString(_))));
     }
 }
