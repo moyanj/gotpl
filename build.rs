@@ -5,6 +5,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // 如果是文档构建，则跳过 Go 编译
+    if env::var("DOCS").is_ok() {
+        println!("cargo:warning=Skipping Go compilation for documentation build.");
+        return;
+    }
+
     // 告诉 Cargo 如果 go_ffi/ffi.go 发生变化，就重新运行 build.rs
     println!("cargo:rerun-if-changed=src/go_ffi/ffi.go");
 

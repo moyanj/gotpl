@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 
 // 将 FFI 绑定代码封装在私有模块中，避免污染上层命名空间。
 // 这是良好的封装实践。
+#[cfg(not(doc))]
 mod goffi {
     // 允许一些 bindgen 生成代码中常见的 lint 警告
     #![allow(non_snake_case)]
@@ -16,6 +17,27 @@ mod goffi {
     #![allow(unused)]
     // 导入 build.rs 生成的 Rust 绑定
     include!(concat!(env!("OUT_DIR"), "/api_bindings.rs"));
+}
+
+#[cfg(doc)]
+mod goffi {
+    // 在文档构建时提供一个模拟的 goffi 模块
+    // 这样可以避免在没有 Go 环境时因缺少 api_bindings.rs 而导致的编译错误
+    #[repr(C)]
+    pub struct RenderResult {
+        pub output: *mut i8,
+        pub error: *mut i8,
+    }
+
+    extern "C" {
+        pub fn RenderTemplate(
+            template_content: *mut i8,
+            json_data: *mut i8,
+            escape_html: bool,
+            use_missing_key_zero: bool,
+        ) -> RenderResult;
+        pub fn FreeResultString(s: *mut i8);
+    }
 }
 
 /// 使用更结构化的枚举来表示可能发生的错误，而不是简单的字符串。
