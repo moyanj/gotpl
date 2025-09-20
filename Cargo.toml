@@ -1,7 +1,15 @@
 [package]
 name = "gotpl"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+authors = ["moyan"]
+description = "A Rust library providing full Go template (text/template and html/template) support via FFI."
+license = "MIT"                                                                                              # 或者你选择的许可证，例如 "Apache-2.0"
+repository = "https://github.com/moyanj/gotpl"                                                               # 你的 Git 仓库地址
+homepage = "https://github.com/moyanj/gotpl"                                                                 # 项目主页，通常也是 Git 仓库地址
+keywords = ["go", "template", "ffi", "html", "text"]                                                         # 帮助用户搜索
+categories = ["template-engine", "web-programming", "ffi"]                                                   # 帮助用户搜索
 
 [dependencies]
 bindgen = "0.72.1"
