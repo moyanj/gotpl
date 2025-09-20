@@ -6,7 +6,7 @@ use std::process::Command;
 
 fn main() {
     // 如果是文档构建，则跳过 Go 编译
-    if env::var("DOCS").is_ok() {
+    if env::var("DOCS_RS").is_ok() {
         println!("cargo:warning=Skipping Go compilation for documentation build.");
         return;
     }
