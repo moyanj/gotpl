@@ -143,11 +143,21 @@ impl<'a, T: Serialize> TemplateRenderer<'a, T> {
         let json_data_string = serde_json::to_string(self.data)?;
         let c_json_data = CString::new(json_data_string)?;
 
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
         // Call Go function
         let result = unsafe {
             OwnedGoResult(goffi::RenderTemplate(
                 c_template.as_ptr() as *mut i8,
                 c_json_data.as_ptr() as *mut i8,
+                self.escape_html,
+                self.use_missing_key_zero,
+            ))
+        };
+        #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+        let result = unsafe {
+            OwnedGoResult(goffi::RenderTemplate(
+                c_template.as_ptr() as *mut u8,
+                c_json_data.as_ptr() as *mut u8,
                 self.escape_html,
                 self.use_missing_key_zero,
             ))
