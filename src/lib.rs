@@ -1,10 +1,9 @@
-// temp_file_1a47289f-bd97-4e1a-85d9-b0e20e0b8d73_pasted_text.rs
-
 use serde::Serialize;
 use std::error::Error;
 use std::ffi::{CStr, CString, NulError};
 use std::fmt::{self, Display, Formatter};
 use std::marker::PhantomData;
+// use std::os::raw::c_char; // 添加这个导入
 
 #[cfg(not(docsrs))]
 mod goffi {
@@ -18,20 +17,22 @@ mod goffi {
 
 #[cfg(docsrs)]
 mod goffi {
+    use std::os::raw::c_char;
+
     #[repr(C)]
     pub struct RenderResult {
-        pub output: *mut i8,
-        pub error: *mut i8,
+        pub output: *mut c_char, // 改为 c_char
+        pub error: *mut c_char,  // 改为 c_char
     }
 
     extern "C" {
         pub fn RenderTemplate(
-            template_content: *mut i8,
-            json_data: *mut i8,
+            template_content: *mut c_char, // 改为 c_char
+            json_data: *mut c_char,        // 改为 c_char
             escape_html: bool,
             use_missing_key_zero: bool,
         ) -> RenderResult;
-        pub fn FreeResultString(s: *mut i8);
+        pub fn FreeResultString(s: *mut c_char); // 改为 c_char
     }
 }
 
@@ -82,8 +83,6 @@ struct OwnedGoResult(goffi::RenderResult);
 
 impl Drop for OwnedGoResult {
     fn drop(&mut self) {
-        // unsafe 代码块被严格限制在 drop 实现中。
-        // 这是确保内存安全的关键。
         unsafe {
             goffi::FreeResultString(self.0.output);
             goffi::FreeResultString(self.0.error);
@@ -137,40 +136,330 @@ impl<'a, T: Serialize> TemplateRenderer<'a, T> {
     /// # Returns
     /// Ok(String) if rendering was successful, Err(RenderError) otherwise.
     pub fn render(self) -> Result<String, RenderError> {
-        //Prepare inputs
+        // Prepare inputs
         let c_template = CString::new(self.template_content)?;
-
         let json_data_string = serde_json::to_string(self.data)?;
         let c_json_data = CString::new(json_data_string)?;
 
-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-        // Call Go function
+        // Call Go function - 注意这里的转换
         let result = unsafe {
             OwnedGoResult(goffi::RenderTemplate(
-                c_template.as_ptr() as *mut i8,
-                c_json_data.as_ptr() as *mut i8,
-                self.escape_html,
-                self.use_missing_key_zero,
-            ))
-        };
-        #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-        let result = unsafe {
-            OwnedGoResult(goffi::RenderTemplate(
-                c_template.as_ptr() as *mut u8,
-                c_json_data.as_ptr() as *mut u8,
+                c_template.into_raw(),  // 使用 into_raw() 而不是 as_ptr() as *mut i8
+                c_json_data.into_raw(), // 使用 into_raw() 而不是 as_ptr() as *mut i8
                 self.escape_html,
                 self.use_missing_key_zero,
             ))
         };
 
         // Process result
-        let output = unsafe { CStr::from_ptr(result.0.output).to_string_lossy() };
-        let error = unsafe { CStr::from_ptr(result.0.error).to_string_lossy() };
+        let output = unsafe {
+            let output_str = CStr::from_ptr(result.0.output)
+                .to_string_lossy()
+                .into_owned();
+            // 重新获取所有权以便后续正确释放
+            let _ = CString::from_raw(result.0.output);
+            output_str
+        };
+
+        let error = unsafe {
+            let error_str = CStr::from_ptr(result.0.error)
+                .to_string_lossy()
+                .into_owned();
+            // 重新获取所有权以便后续正确释放
+            let _ = CString::from_raw(result.0.error);
+            error_str
+        };
 
         if !error.is_empty() {
-            Err(RenderError::GoExecution(error.into_owned()))
+            Err(RenderError::GoExecution(error))
         } else {
-            Ok(output.into_owned())
+            Ok(output)
+        }
+    }
+}
+
+// 为方便使用添加的便捷函数
+impl<'a, T: Serialize> TemplateRenderer<'a, T> {
+    /// 快速渲染模板的便捷方法
+    pub fn render_quick(template: &'a str, data: &'a T) -> Result<String, RenderError> {
+        Self::new(template, data).render()
+    }
+
+    /// 渲染HTML转义的模板
+    pub fn render_html(template: &'a str, data: &'a T) -> Result<String, RenderError> {
+        Self::new(template, data).escape_html(true).render()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Serialize;
+
+    #[derive(Serialize, Debug)]
+    struct SimpleData {
+        name: String,
+        age: u32,
+        active: bool,
+    }
+
+    #[derive(Serialize)]
+    struct NestedData {
+        user: SimpleData,
+        website: String,
+    }
+
+    #[derive(Serialize)]
+    struct EmptyData {}
+
+    // 基础功能测试
+    #[test]
+    fn test_basic_template_rendering() {
+        let data = SimpleData {
+            name: "Alice".to_string(),
+            age: 30,
+            active: true,
+        };
+
+        let template = "Hello, {{.name}}! You are {{.age}} years old.";
+        let result = TemplateRenderer::render_quick(template, &data).unwrap();
+
+        assert_eq!(result, "Hello, Alice! You are 30 years old.");
+    }
+
+    // HTML 转义测试
+    #[test]
+    fn test_html_escaping() {
+        let data = SimpleData {
+            name: "<script>alert('xss')</script>".to_string(),
+            age: 25,
+            active: false,
+        };
+
+        let template = "Welcome, {{.name}}";
+
+        // 不转义 HTML
+        let result_no_escape = TemplateRenderer::new(template, &data)
+            .escape_html(false)
+            .render()
+            .unwrap();
+        assert_eq!(result_no_escape, "Welcome, <script>alert('xss')</script>");
+
+        // 转义 HTML
+        let result_escape = TemplateRenderer::new(template, &data)
+            .escape_html(true)
+            .render()
+            .unwrap();
+        assert!(result_escape.contains("&lt;script&gt;"));
+        assert!(result_escape.contains("&lt;/script&gt;"));
+    }
+
+    // 嵌套数据结构测试
+    #[test]
+    fn test_nested_data() {
+        let user_data = SimpleData {
+            name: "Bob".to_string(),
+            age: 35,
+            active: true,
+        };
+
+        let data = NestedData {
+            user: user_data,
+            website: "example.com".to_string(),
+        };
+
+        let template = "User: {{.user.name}}, Website: {{.website}}";
+        let result = TemplateRenderer::render_quick(template, &data).unwrap();
+
+        assert_eq!(result, "User: Bob, Website: example.com");
+    }
+
+    // 布尔值和条件测试
+    #[test]
+    fn test_boolean_conditional() {
+        let data = SimpleData {
+            name: "Charlie".to_string(),
+            age: 40,
+            active: true,
+        };
+
+        let template = "{{.name}} is {{if .active}}active{{else}}inactive{{end}}";
+        let result = TemplateRenderer::render_quick(template, &data).unwrap();
+
+        assert_eq!(result, "Charlie is active");
+    }
+
+    // 缺失键处理测试
+    #[test]
+    fn test_missing_key_handling() {
+        let data = SimpleData {
+            name: "David".to_string(),
+            age: 28,
+            active: false,
+        };
+
+        // 测试访问不存在的字段
+        let template = "Name: {{.name}}, Missing: {{.nonexistent}}";
+
+        // 使用 zero 行为
+        let result_zero = TemplateRenderer::new(template, &data)
+            .use_missing_key_zero(true)
+            .render()
+            .unwrap();
+
+        // 在 missingkey=zero 模式下，不存在的字段应该为空
+        assert_eq!(result_zero, "Name: David, Missing: ");
+
+        // 默认模式下可能会出错（取决于 Go 模板的默认行为）
+        // 这里我们只测试 zero 模式，因为默认模式的行为可能因配置而异
+    }
+
+    // 空数据测试
+    #[test]
+    fn test_empty_data() {
+        let data = EmptyData {};
+        let template = "Static content";
+        let result = TemplateRenderer::render_quick(template, &data).unwrap();
+
+        assert_eq!(result, "Static content");
+    }
+
+    // 复杂模板语法测试
+    #[test]
+    fn test_complex_template() {
+        let data = SimpleData {
+            name: "Eve".to_string(),
+            age: 32,
+            active: true,
+        };
+
+        let template = r#"
+User Profile:
+-----------
+Name: {{.name}}
+Age: {{.age}}
+Status: {{if .active}}Active{{else}}Inactive{{end}}
+
+{{range $i, $e := .}}
+Field {{$i}}: {{$e}}
+{{end}}
+"#;
+
+        let result = TemplateRenderer::render_quick(template, &data).unwrap();
+        assert!(result.contains("Name: Eve"));
+        assert!(result.contains("Age: 32"));
+        assert!(result.contains("Status: Active"));
+    }
+
+    // 错误处理测试
+    #[test]
+    fn test_error_handling() {
+        let data = SimpleData {
+            name: "Frank".to_string(),
+            age: 45,
+            active: false,
+        };
+
+        // 无效的模板语法
+        let invalid_template = "Hello, {{.name}"; // 缺少闭合括号
+        let result = TemplateRenderer::render_quick(invalid_template, &data);
+
+        assert!(result.is_err());
+        if let Err(RenderError::GoExecution(err)) = result {
+            assert!(err.contains("template") || err.contains("parse") || err.contains("execute"));
+        } else {
+            panic!("Expected GoExecution error");
+        }
+    }
+
+    // 便捷方法测试
+    #[test]
+    fn test_convenience_methods() {
+        let data = SimpleData {
+            name: "Grace".to_string(),
+            age: 29,
+            active: true,
+        };
+
+        let template = "Hello, {{.name}}";
+
+        // 测试 render_quick
+        let quick_result = TemplateRenderer::render_quick(template, &data).unwrap();
+        assert_eq!(quick_result, "Hello, Grace");
+
+        // 测试 render_html
+        let html_result = TemplateRenderer::render_html(template, &data).unwrap();
+        assert_eq!(html_result, "Hello, Grace"); // 没有特殊字符时应该相同
+    }
+
+    // 特殊字符测试
+    #[test]
+    fn test_special_characters() {
+        let data = SimpleData {
+            name: "O'Reilly".to_string(),
+            age: 50,
+            active: false,
+        };
+
+        let template = "Name: {{.name}}, Quote: \"test\"";
+        let result = TemplateRenderer::render_quick(template, &data).unwrap();
+
+        assert!(result.contains("O'Reilly"));
+        assert!(result.contains("Quote: \"test\""));
+    }
+
+    // 边界值测试
+    #[test]
+    fn test_edge_cases() {
+        // 空字符串
+        let empty_data = SimpleData {
+            name: "".to_string(),
+            age: 0,
+            active: false,
+        };
+
+        let template = "Empty name: '{{.name}}'";
+        let result = TemplateRenderer::render_quick(template, &empty_data).unwrap();
+        assert_eq!(result, "Empty name: ''");
+
+        // 很长的字符串
+        let long_name = "A".repeat(1000);
+        let long_data = SimpleData {
+            name: long_name.clone(),
+            age: 99,
+            active: true,
+        };
+
+        let template = "Long: {{.name}}";
+        let result = TemplateRenderer::render_quick(template, &long_data).unwrap();
+        assert_eq!(result, format!("Long: {}", long_name));
+    }
+
+    // 序列化错误测试
+    #[test]
+    fn test_serialization_error() {
+        // 创建一个无法序列化的数据类型
+        struct UnserializableData;
+
+        impl Serialize for UnserializableData {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::Error;
+                Err(S::Error::custom("Intentionally failed serialization"))
+            }
+        }
+
+        let data = UnserializableData;
+        let template = "Test {{.field}}";
+        let result = TemplateRenderer::render_quick(template, &data);
+
+        assert!(result.is_err());
+        if let Err(RenderError::JsonSerialization(_)) = result {
+            // 期望的序列化错误
+        } else {
+            panic!("Expected JsonSerialization error");
         }
     }
 }
